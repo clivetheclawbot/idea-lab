@@ -1,7 +1,7 @@
 # idea-lab
 
 <p align="center">
-  <img src="docs/hero.jpg" alt="A corkboard of pinned idea cards in warm afternoon light — phone parked in a mug, cat asleep, nothing urgent" width="720">
+  <img src="docs/hero.jpg" alt="Pinned idea cards on a wall in warm afternoon light — phone parked in a mug, a large black cat asleep on the desk, nothing urgent" width="720">
 </p>
 
 Tiny local web app for running visual idea sessions — built for an agent to

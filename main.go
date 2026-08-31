@@ -51,7 +51,7 @@ type Board struct {
 	Bullets     []string  `json:"bullets"`
 	ImagePrompt string    `json:"imagePrompt"`
 	ImagePath   string    `json:"imagePath"` // served path, e.g. /img/x.png; empty = gradient placeholder
-	ImageURL    string    `json:"imageUrl"`   // remote photo, used if provided directly
+	ImageURL    string    `json:"imageUrl"`  // remote photo, used if provided directly
 	CreatedAt   time.Time `json:"created_at"`
 	ImageNote   string    `json:"image_note,omitempty"` // error/notice shown under the image area
 }

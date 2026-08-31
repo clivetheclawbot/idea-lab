@@ -324,6 +324,49 @@ func apiBoard(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"url": "/board/" + in.ID, "id": in.ID})
 }
 
+// apiBoardEdit handles PUT /api/board/{id} — updates mutable fields.
+// If imagePath is empty and imagePrompt is set, regenerates the illustration;
+// otherwise keeps the existing image (fast content edits, no re-gen).
+func apiBoardEdit(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	boards := loadBoards()
+	var existing *Board
+	for i := range boards {
+		if boards[i].ID == id {
+			existing = &boards[i]
+			break
+		}
+	}
+	if existing == nil {
+		http.Error(w, "no such board", http.StatusNotFound)
+		return
+	}
+	var in Board
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil {
+		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if in.ImagePath == "" && in.ImagePrompt != "" && in.ImagePrompt != existing.ImagePrompt {
+		path, note := generateImage(in.ImagePrompt)
+		if path != "" {
+			in.ImagePath = path
+			in.ImageNote = ""
+		} else {
+			in.ImagePath, in.ImageNote = existing.ImagePath, note
+		}
+	} else if in.ImagePath == "" {
+		in.ImagePath = existing.ImagePath
+	}
+	in.ID = existing.ID // preserve full id even if the path used a suffix
+	in.CreatedAt = existing.CreatedAt
+	if err := saveBoard(in); err != nil {
+		http.Error(w, "save failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"url": "/board/" + in.ID, "id": in.ID})
+}
+
 // apiPhoto handles GET /api/photo?q=… returning Openverse references as JSON.
 func apiPhoto(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -340,50 +383,256 @@ func apiBoards(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(loadBoards())
 }
 
-// clientMode creates a board via the running server's API.
-func clientMode(addr, title, subtitle, bullets, prompt, imageURL string) {
-	payload := map[string]any{"title": title, "subtitle": subtitle, "imagePrompt": prompt, "imageUrl": imageURL}
-	if bullets != "" {
-		payload["bullets"] = strings.Split(bullets, ";")
+// clientURL derives the base URL for the API from the -addr flag value.
+func clientURL(addr string) string {
+	host := addr
+	if h, ok := strings.CutPrefix(addr, "0.0.0.0"); ok {
+		host = h
 	}
+	if host == "" || strings.HasPrefix(host, ":") {
+		host = "127.0.0.1" + host
+	}
+	return "http://" + host
+}
+
+// apiCall POSTs/PUTs a JSON payload and decodes {url,id}.
+func apiCall(method, url string, payload any) (string, string) {
 	raw, _ := json.Marshal(payload)
-	resp, err := http.Post("http://127.0.0.1"+strings.TrimPrefix(addr, "0.0.0.0")+"/api/board",
-		"application/json", bytes.NewReader(raw))
+	req, err := http.NewRequest(method, url, bytes.NewReader(raw))
 	if err != nil {
-		log.Fatal("server unreachable — is ./idea-lab running?", err)
+		log.Fatal("bad request: ", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Fatal("server unreachable — is the idea-lab service running?")
 	}
 	defer resp.Body.Close()
 	var out struct{ URL, ID string }
 	json.NewDecoder(resp.Body).Decode(&out)
-	if out.URL == "" {
-		log.Fatal("board creation failed")
+	if out.ID == "" {
+		log.Fatalf("%s failed (%s)", method, resp.Status)
 	}
-	host := strings.TrimPrefix(addr, "0.0.0.0")
-	fmt.Printf("board created: http://192.168.1.58%s%s\n", host, out.URL)
+	return out.URL, out.ID
+}
+
+// findBoardID does a best-effort match of query against board IDs.
+func findBoardID(query string) string {
+	_, body, err := apiGet("http://127.0.0.1:8899", "/api/boards")
+	if err != nil || body == nil {
+		return ""
+	}
+	var boards []Board
+	json.Unmarshal(body, &boards)
+	for _, b := range boards {
+		if b.ID == query || strings.HasSuffix(b.ID, query) {
+			return b.ID
+		}
+	}
+	return ""
+}
+
+// apiGet fetches a path from the local server, returning status + body.
+func apiGet(base, path string) (int, []byte, error) {
+	resp, err := http.Get(base + path)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw, err
+}
+
+// clientCreate / clientEdit / clientList drive the server via its API.
+func clientCreate(base, title, sub, bullets, prompt, imageURL string) {
+	payload := map[string]any{"title": title, "subtitle": sub, "imagePrompt": prompt, "imageUrl": imageURL}
+	if bullets != "" {
+		payload["bullets"] = strings.Split(bullets, ";")
+	}
+	urlStr, id := apiCall(http.MethodPost, base+"/api/board", payload)
+	fmt.Printf("board created: %s%s\n", lanHost(), urlStr)
+	_ = id
+}
+
+func clientEdit(base, idQuery, title, sub, bullets, prompt, imageURL, imgPath string) {
+	payload := map[string]any{"title": title, "subtitle": sub, "imagePrompt": prompt, "imageUrl": imageURL, "imagePath": imgPath}
+	if bullets != "" {
+		payload["bullets"] = strings.Split(bullets, ";")
+	}
+	id := findBoardID(idQuery)
+	if id == "" {
+		log.Fatal("no board matches '", idQuery, "' — try ./idea-lab ls")
+	}
+	urlStr, _ := apiCall(http.MethodPut, base+"/api/board/"+id, payload)
+	fmt.Printf("board updated: %s%s\n", lanHost(), urlStr)
+}
+
+func clientList(base string) {
+	_, raw, done := apiCallList(base + "/api/boards")
+	if done != nil {
+		log.Fatal("server unreachable — is the idea-lab service running?")
+	}
+	var boards []Board
+	json.Unmarshal(raw, &boards)
+	for _, b := range boards {
+		img := b.ImagePath
+		if img == "" && b.ImageURL != "" {
+			img = "remote:" + b.ImageURL
+		}
+		if img == "" {
+			img = "(placeholder)"
+		}
+		fmt.Printf("%s  %-24s %s\n", b.ID, b.Title, img)
+	}
+}
+
+func lanHost() string {
+	return "http://192.168.1.58:8899"
+}
+
+func apiCallList(url string) (int, []byte, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw, err
 }
 
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8899", "listen address")
-	title := flag.String("new", "", "client mode: create a board with this title")
-	subtitle := flag.String("sub", "", "board subtitle")
-	bullets := flag.String("bullets", "", "semicolon-separated bullets")
-	prompt := flag.String("prompt", "", "image generation prompt")
-	imageURL := flag.String("imgurl", "", "use this remote image URL instead of generating")
 	flag.Parse()
+	args := flag.Args()
 
-	if *title != "" {
-		clientMode(*addr, *title, *subtitle, *bullets, *prompt, *imageURL)
+	usage := func() {
+		fmt.Fprintln(os.Stderr, `usage:
+  idea-lab [-addr 0.0.0.0:8899]                      # run the server
+  idea-lab new "Title" [-sub …] [-bullets "a;b;c"] [-prompt …] [-imgurl …]
+  idea-lab edit <id-suffix> [-title …] [-sub …] [-bullets …] [-prompt …] [-imgpath /img/x.png]
+  idea-lab ls`)
+		os.Exit(2)
+	}
+	if len(args) == 0 {
+		serve(*addr)
 		return
 	}
 
+	// Re-parse remaining args with the verb-specific flag sets.
+	base := clientURL(*addr)
+	verb := args[0]
+	rest := args[1:]
+
+	switch verb {
+	case "ls":
+		clientList(base)
+	case "new", "edit":
+		editMode := verb == "edit"
+		flags, positional := parseVerbArgs(rest)
+		if editMode && len(positional) == 0 {
+			usage()
+		}
+		// NOTE: hand-rolled parsing on purpose — Go's flag package stops at
+		// the first positional arg, which swallowed every flag after the
+		// title/id. Do not "simplify" this back to flag.NewFlagSet.
+		title := flags["title"]
+		if len(positional) > 0 && title == "" && !editMode {
+			title = positional[0]
+		}
+		if title == "" && !editMode {
+			usage()
+		}
+		if editMode {
+			idQuery := positional[0]
+			cur := fetchBoard(idQuery)
+			if cur == nil {
+				log.Fatal("no board matches '", idQuery, "' — try ./idea-lab ls")
+			}
+			subV := firstNonEmpty(flags["sub"], cur.Subtitle)
+			bV := firstNonEmpty(flags["bullets"], strings.Join(cur.Bullets, ";"))
+			pV := firstNonEmpty(flags["prompt"], cur.ImagePrompt)
+			iu := firstNonEmpty(flags["imgurl"], cur.ImageURL)
+			// New prompt (and no explicit image override) => regenerate.
+			// Unchanged prompt => keep the existing illustration.
+			ip := ""
+			switch {
+			case flags["imgpath"] != "":
+				ip = flags["imgpath"]
+			case flags["imgurl"] != "":
+				ip = ""
+			case flags["prompt"] == "" || flags["prompt"] == cur.ImagePrompt:
+				ip = cur.ImagePath
+			}
+			titleV := firstNonEmpty(title, cur.Title)
+			clientEdit(base, idQuery, titleV, subV, bV, pV, iu, ip)
+			return
+		}
+		clientCreate(base, title, flags["sub"], flags["bullets"], flags["prompt"], flags["imgurl"])
+	default:
+		usage()
+	}
+}
+
+// parseVerbArgs splits raw args into flag values and positionals.
+// "-flag value" pairs are consumed in order; a flag without a following
+// value gets "".
+func parseVerbArgs(args []string) (map[string]string, []string) {
+	flags := map[string]string{}
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			name := strings.TrimLeft(a, "-")
+			if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+				flags[name] = args[i+1]
+				i++
+			} else {
+				flags[name] = ""
+			}
+			continue
+		}
+		positional = append(positional, a)
+	}
+	return flags, positional
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// fetchBoard returns the current board for an id or id-suffix query.
+func fetchBoard(query string) *Board {
+	_, body, err := apiGet("http://127.0.0.1:8899", "/api/boards")
+	if err != nil || body == nil {
+		return nil
+	}
+	var boards []Board
+	json.Unmarshal(body, &boards)
+	for i := range boards {
+		id := boards[i].ID
+		if id == query || strings.HasSuffix(id, query) {
+			return &boards[i]
+		}
+	}
+	return nil
+}
+
+// serve runs the HTTP server.
+func serve(addr string) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", idxPage)
+	mux.HandleFunc("GET /{$}", idxPage)
 	mux.HandleFunc("GET /board/", boardPage)
 	mux.HandleFunc("POST /api/board", apiBoard)
+	mux.HandleFunc("PUT /api/board/{id}", apiBoardEdit)
 	mux.HandleFunc("GET /api/boards", apiBoards)
 	mux.HandleFunc("GET /api/photo", apiPhoto)
 	mux.Handle("GET /img/", http.FileServer(http.Dir(dir)))
 
-	log.Printf("idea-lab serving on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	log.Printf("idea-lab serving on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
 }

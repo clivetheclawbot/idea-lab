@@ -9,23 +9,28 @@ Real-world photo references via `GET /api/photo?q=…` (Openverse, no key).
 
 ## Run
 
+It's a systemd user service (enabled at boot, restarts on failure):
+
 ```sh
-./idea-lab -addr 0.0.0.0:8899
+systemctl --user status idea-lab     # check
+systemctl --user restart idea-lab    # nudge
+journalctl --user -u idea-lab -f     # logs
 ```
 
 Then visit http://<this-host>:8899 from any device on the LAN.
 
-## Create a board (client mode)
+## Client commands
 
 ```sh
-./idea-lab -new "Cellar Tracker" \
-  -sub "Drink what you own, before it peaks" \
-  -bullets "Scan labels;Drinking-window nudges;Pairs with dinner" \
-  -prompt "A cosy wine cellar in soft afternoon light"
+./idea-lab new "Title" -sub "…" -bullets "a;b;c" -prompt "…" [-imgurl URL]
+./idea-lab edit <id-suffix> [-title …] [-sub …] [-bullets …] [-prompt …] [-imgpath /img/x.png]
+./idea-lab ls
 ```
 
-Note: with Go's flag package, put the `-new` value first — later `flag`
-arguments after the first non-flag arg are not parsed.
+- `new` generates an illustration (gpt-image-1, ~30–60 s).
+- `edit` is instant when `-prompt` is unchanged (keeps the existing image);
+  a changed prompt regenerates. `-imgpath` forces a specific image.
+- Flags and positionals can be interleaved; quote values with spaces.
 
 ## Auth
 

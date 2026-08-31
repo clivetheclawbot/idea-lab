@@ -35,8 +35,7 @@ Then visit http://<this-host>:8899 from any device on the LAN.
 ## Auth
 
 Reads `OPENAI_API_KEY` from the env, or falls back to a `.env` file here
-(`OPENAI_API_KEY=…`, chmod 600). The key lives in 1Password vault "Clive"
-(item "OpenAI Key").
+(`OPENAI_API_KEY=…`, chmod 600).
 
 ## Files
 

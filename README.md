@@ -1,7 +1,11 @@
 # idea-lab
 
-Tiny local web app for running visual idea sessions — built for Bertie to
-interview Edele about her next side project.
+<p align="center">
+  <img src="docs/hero.jpg" alt="A corkboard of pinned idea cards in warm afternoon light — phone parked in a mug, cat asleep, nothing urgent" width="720">
+</p>
+
+Tiny local web app for running visual idea sessions — built for an agent to
+interview a human about their next side project.
 
 Each "board" is a title, subtitle, bullets, and an AI-generated illustration
 (OpenAI `gpt-image-1`). Gallery at `/`, individual boards at `/board/<id>`.

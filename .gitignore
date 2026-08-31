@@ -2,5 +2,6 @@
 idea-lab
 img/
 boards/
+proto/
 server.log
 *.bak

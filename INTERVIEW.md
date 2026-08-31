@@ -64,8 +64,9 @@ Offer only if Phase 1–3 genuinely produce nothing:
 
 1. **Cellar tracker + drinking-window assistant.** Photo-scan labels, track
    the collection, get "drink this before it peaks" nudges. Synergy hook:
-   Kieran's recipes.kieranajp.uk MCP has pantry tools — pairing tonight's
-   recipe against the shared cellar is the killer feature nobody has.
+   the recipe app at recipes.kieranajp.uk exposes an MCP with pantry
+   tools (real fridge stock) — pairing tonight's recipe against the shared
+   cellar is the killer feature nobody has.
 2. **WSET SAT tasting companion.** Structured tasting notes graded against
    the WSET Systematic Approach to Tasting rubric + spaced-repetition theory
    drills. Build for the level below hers; you teach best what you just

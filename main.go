@@ -56,8 +56,11 @@ type Board struct {
 	ImageNote   string    `json:"image_note,omitempty"` // error/notice shown under the image area
 }
 
-func boardsDir() string { return filepath.Join(dir, "boards") }
-func imgDir() string    { return filepath.Join(dir, "img") }
+// Seams for tests: overridable per-test to point at t.TempDir().
+var (
+	boardsDir = func() string { return filepath.Join(dir, "boards") }
+	imgDir    = func() string { return filepath.Join(dir, "img") }
+)
 
 func loadBoards() []Board {
 	entries, err := os.ReadDir(boardsDir())

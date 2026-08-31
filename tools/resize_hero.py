@@ -2,7 +2,7 @@
 from PIL import Image
 import os
 
-SRC = os.path.expanduser("~/projects/idea-lab/docs/hero.png")
+SRC = os.path.expanduser("~/projects/idea-lab/docs/hero-black.png")
 DST = os.path.expanduser("~/projects/idea-lab/docs/hero.jpg")
 
 img = Image.open(SRC).convert("RGB")

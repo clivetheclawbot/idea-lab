@@ -10,11 +10,10 @@
 //
 // Create a board from the command line (same binary, client mode):
 //
-//	./idea-lab -new \
-//	  -title "Cellar Tracker" \
-//	  -subtitle "Drink what you own, before it peaks" \
+//	./idea-lab new "Cellar Tracker" \
+//	  -sub "Drink what you own, before it peaks" \
 //	  -bullets "Scan labels;Drinking-window nudges;Pairs with dinner" \
-//	  -prompt "A cozy minimalist wine cellar app concept, warm pastel illustration"
+//	  -prompt "A cozy wine cellar concept, warm pastel illustration"
 //
 // API:
 //
@@ -36,6 +35,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -82,7 +82,14 @@ func loadBoards() []Board {
 	return boards
 }
 
+// boardIDRe constrains board ids to safe filename characters — no separators,
+// no traversal. Enforced on every save, regardless of where the id came from.
+var boardIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+
 func saveBoard(b Board) error {
+	if !boardIDRe.MatchString(b.ID) {
+		return fmt.Errorf("invalid board id %q", b.ID)
+	}
 	if err := os.MkdirAll(boardsDir(), 0o755); err != nil {
 		return err
 	}
@@ -90,10 +97,15 @@ func saveBoard(b Board) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(boardsDir(), b.ID+".json"), raw, 0o644)
+	dst := filepath.Join(boardsDir(), b.ID+".json")
+	tmp := dst + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst) // atomic: readers never see a partial write
 }
 
-// slugID makes a readable, collision-resistant id like "0311-cellar-tracker".
+// slugID makes a readable, collision-resistant id like "0831-221540-cellar-tracker".
 func slugID(title string) string {
 	t := time.Now()
 	slug := strings.ToLower(strings.Join(strings.Fields(title), "-"))
@@ -109,7 +121,15 @@ func slugID(title string) string {
 	if len(slug) > 40 {
 		slug = slug[:40]
 	}
-	return fmt.Sprintf("%s-%s", t.Format("0102-1504"), slug)
+	cand := fmt.Sprintf("%s-%s", t.Format("0102-150405"), slug)
+	// Defend against same-second, same-title collisions.
+	for i := 2; ; i++ {
+		if _, err := os.Stat(filepath.Join(boardsDir(), cand+".json")); os.IsNotExist(err) {
+			break
+		}
+		cand = fmt.Sprintf("%s-%s-%d", t.Format("0102-150405"), slug, i)
+	}
+	return cand
 }
 
 // generateImage calls the OpenAI images API and stores the PNG locally.
@@ -122,6 +142,7 @@ func generateImage(prompt string) (string, string) {
 			for _, line := range strings.Split(string(data), "\n") {
 				if v, ok := strings.CutPrefix(strings.TrimSpace(line), "OPENAI_API_KEY="); ok {
 					key = strings.TrimSpace(v)
+					break // first match wins; ignore later duplicates
 				}
 			}
 		}
@@ -298,6 +319,53 @@ func boardPage(w http.ResponseWriter, r *http.Request) {
 	http.NotFound(w, r)
 }
 
+// maxFieldLen caps string fields to keep stored boards sane.
+const maxFieldLen = 2000
+
+// validImageRef accepts only relative /img/… paths or http(s) URLs — anything
+// else (javascript:, data:, file:, blank weirdness) is rejected.
+func validImageRef(ref string) bool {
+	if ref == "" {
+		return true
+	}
+	if strings.HasPrefix(ref, "/img/") {
+		return true
+	}
+	if u, err := url.Parse(ref); err == nil {
+		switch u.Scheme {
+		case "http", "https":
+			return true
+		}
+	}
+	return false
+}
+
+// sanitize validates and normalises client-supplied board fields.
+func sanitize(b *Board) error {
+	b.Title = strings.TrimSpace(b.Title)
+	if b.Title == "" {
+		return fmt.Errorf("title required")
+	}
+	if len(b.Title) > 200 || len(b.Subtitle) > 300 || len(b.ImagePrompt) > maxFieldLen {
+		return fmt.Errorf("field too long")
+	}
+	if len(b.Bullets) > 12 {
+		return fmt.Errorf("too many bullets")
+	}
+	for i, bl := range b.Bullets {
+		if len(bl) > 300 {
+			return fmt.Errorf("bullet %d too long", i+1)
+		}
+	}
+	if !validImageRef(b.ImageURL) {
+		return fmt.Errorf("imageUrl must be /img/… or an http(s) URL")
+	}
+	if !validImageRef(b.ImagePath) {
+		return fmt.Errorf("imagePath must be an /img/… path")
+	}
+	return nil
+}
+
 // apiBoard handles POST /api/board ({"title","subtitle","bullets":[],"imagePrompt","imageUrl"}).
 func apiBoard(w http.ResponseWriter, r *http.Request) {
 	var in Board
@@ -306,8 +374,8 @@ func apiBoard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.Title = strings.TrimSpace(in.Title)
-	if in.Title == "" {
-		http.Error(w, "title required", http.StatusBadRequest)
+	if err := sanitize(&in); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if in.ImageURL == "" && in.ImagePrompt != "" {
@@ -324,9 +392,9 @@ func apiBoard(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"url": "/board/" + in.ID, "id": in.ID})
 }
 
-// apiBoardEdit handles PUT /api/board/{id} — updates mutable fields.
-// If imagePath is empty and imagePrompt is set, regenerates the illustration;
-// otherwise keeps the existing image (fast content edits, no re-gen).
+// apiBoardEdit handles PUT /api/board/{id} — a MERGE update: omitted fields
+// keep their stored values. If imagePrompt is new and no explicit image is
+// set, regenerates the illustration; otherwise keeps the existing image.
 func apiBoardEdit(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	boards := loadBoards()
@@ -341,30 +409,62 @@ func apiBoardEdit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such board", http.StatusNotFound)
 		return
 	}
-	var in Board
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in); err != nil {
+	var patch map[string]json.RawMessage
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&patch); err != nil {
 		http.Error(w, "bad JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if in.ImagePath == "" && in.ImagePrompt != "" && in.ImagePrompt != existing.ImagePrompt {
-		path, note := generateImage(in.ImagePrompt)
-		if path != "" {
-			in.ImagePath = path
-			in.ImageNote = ""
-		} else {
-			in.ImagePath, in.ImageNote = existing.ImagePath, note
-		}
-	} else if in.ImagePath == "" {
-		in.ImagePath = existing.ImagePath
+	out := *existing // start from stored values; patch only what arrived
+	decode := func(key string, dst any) bool {
+		raw, ok := patch[key]
+		return ok && json.Unmarshal(raw, dst) == nil
 	}
-	in.ID = existing.ID // preserve full id even if the path used a suffix
-	in.CreatedAt = existing.CreatedAt
-	if err := saveBoard(in); err != nil {
+	var title, subtitle, prompt, imageURL, imagePath, note string
+	var bullets []string
+	if decode("title", &title) {
+		out.Title = strings.TrimSpace(title)
+	}
+	if decode("subtitle", &subtitle) {
+		out.Subtitle = subtitle
+	}
+	if decode("bullets", &bullets) {
+		out.Bullets = bullets
+	}
+	if decode("imagePrompt", &prompt) {
+		out.ImagePrompt = prompt
+	}
+	if decode("imageNote", &note) {
+		out.ImageNote = note
+	}
+	imageURLSupplied := decode("imageUrl", &imageURL)
+	if imageURLSupplied {
+		out.ImageURL = imageURL
+	}
+	imagePathSupplied := decode("imagePath", &imagePath)
+	if imagePathSupplied {
+		out.ImagePath = imagePath
+	}
+	if err := sanitize(&out); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	// Illustration policy: a supplied (non-empty) new prompt regenerates,
+	// unless the caller explicitly supplied imagePath/imageUrl.
+	newPrompt := strings.TrimSpace(out.ImagePrompt)
+	if !imagePathSupplied && !imageURLSupplied && newPrompt != "" && newPrompt != existing.ImagePrompt {
+		path, genNote := generateImage(newPrompt)
+		if path != "" {
+			out.ImagePath, out.ImageNote = path, ""
+		} else {
+			out.ImagePath, out.ImageNote = existing.ImagePath, genNote
+		}
+	}
+	if err := saveBoard(out); err != nil {
 		http.Error(w, "save failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"url": "/board/" + in.ID, "id": in.ID})
+	json.NewEncoder(w).Encode(map[string]string{"url": "/board/" + out.ID, "id": out.ID})
 }
 
 // apiPhoto handles GET /api/photo?q=… returning Openverse references as JSON.
@@ -396,6 +496,10 @@ func clientURL(addr string) string {
 }
 
 // apiCall POSTs/PUTs a JSON payload and decodes {url,id}.
+// Uses a timeout client (image generation can take ~90 s server-side)
+// and fails on non-2xx with the server's message.
+var localClient = &http.Client{Timeout: 6 * time.Minute}
+
 func apiCall(method, url string, payload any) (string, string) {
 	raw, _ := json.Marshal(payload)
 	req, err := http.NewRequest(method, url, bytes.NewReader(raw))
@@ -403,11 +507,15 @@ func apiCall(method, url string, payload any) (string, string) {
 		log.Fatal("bad request: ", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := localClient.Do(req)
 	if err != nil {
 		log.Fatal("server unreachable — is the idea-lab service running?")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
+		log.Fatalf("%s failed: HTTP %d: %s", method, resp.StatusCode, string(body))
+	}
 	var out struct{ URL, ID string }
 	json.NewDecoder(resp.Body).Decode(&out)
 	if out.ID == "" {
@@ -416,9 +524,12 @@ func apiCall(method, url string, payload any) (string, string) {
 	return out.URL, out.ID
 }
 
+// localAPIBase is what client-side helpers (findBoardID, fetchBoard) talk to.
+var localAPIBase = "http://127.0.0.1:8899"
+
 // findBoardID does a best-effort match of query against board IDs.
 func findBoardID(query string) string {
-	_, body, err := apiGet("http://127.0.0.1:8899", "/api/boards")
+	_, body, err := apiGet(localAPIBase, "/api/boards")
 	if err != nil || body == nil {
 		return ""
 	}
@@ -434,7 +545,7 @@ func findBoardID(query string) string {
 
 // apiGet fetches a path from the local server, returning status + body.
 func apiGet(base, path string) (int, []byte, error) {
-	resp, err := http.Get(base + path)
+	resp, err := localClient.Get(base + path)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -449,27 +560,24 @@ func clientCreate(base, title, sub, bullets, prompt, imageURL string) {
 	if bullets != "" {
 		payload["bullets"] = strings.Split(bullets, ";")
 	}
-	urlStr, id := apiCall(http.MethodPost, base+"/api/board", payload)
-	fmt.Printf("board created: %s%s\n", lanHost(), urlStr)
-	_ = id
+	urlStr, _ := apiCall(http.MethodPost, base+"/api/board", payload)
+	fmt.Printf("board created: %s%s\n", lanHost(base), urlStr)
 }
 
-func clientEdit(base, idQuery, title, sub, bullets, prompt, imageURL, imgPath string) {
-	payload := map[string]any{"title": title, "subtitle": sub, "imagePrompt": prompt, "imageUrl": imageURL, "imagePath": imgPath}
-	if bullets != "" {
-		payload["bullets"] = strings.Split(bullets, ";")
-	}
+// clientEdit sends only the fields the user actually passed; the server
+// merges them into the stored board.
+func clientEdit(base, idQuery string, payload map[string]any) {
 	id := findBoardID(idQuery)
 	if id == "" {
 		log.Fatal("no board matches '", idQuery, "' — try ./idea-lab ls")
 	}
 	urlStr, _ := apiCall(http.MethodPut, base+"/api/board/"+id, payload)
-	fmt.Printf("board updated: %s%s\n", lanHost(), urlStr)
+	fmt.Printf("board updated: %s%s\n", lanHost(base), urlStr)
 }
 
 func clientList(base string) {
-	_, raw, done := apiCallList(base + "/api/boards")
-	if done != nil {
+	_, raw, err := apiGet(base, "/api/boards")
+	if err != nil {
 		log.Fatal("server unreachable — is the idea-lab service running?")
 	}
 	var boards []Board
@@ -486,18 +594,12 @@ func clientList(base string) {
 	}
 }
 
-func lanHost() string {
-	return "http://192.168.1.58:8899"
-}
-
-func apiCallList(url string) (int, []byte, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return 0, nil, err
+// lanHost derives the LAN-displayable base from the local API base.
+func lanHost(base string) string {
+	if s, ok := strings.CutPrefix(base, "http://127.0.0.1"); ok {
+		return "http://192.168.1.58" + s
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	return resp.StatusCode, raw, err
+	return base
 }
 
 func main() {
@@ -535,6 +637,8 @@ func main() {
 		// NOTE: hand-rolled parsing on purpose — Go's flag package stops at
 		// the first positional arg, which swallowed every flag after the
 		// title/id. Do not "simplify" this back to flag.NewFlagSet.
+		// Limitation by design: values starting with "-" need -title= syntax
+		// via "title" (or just avoid leading dashes). No --flag=value form.
 		title := flags["title"]
 		if len(positional) > 0 && title == "" && !editMode {
 			title = positional[0]
@@ -544,27 +648,30 @@ func main() {
 		}
 		if editMode {
 			idQuery := positional[0]
-			cur := fetchBoard(idQuery)
-			if cur == nil {
-				log.Fatal("no board matches '", idQuery, "' — try ./idea-lab ls")
+			// Patch semantics: only include fields the user actually passed.
+			payload := map[string]any{}
+			if title != "" {
+				payload["title"] = title
 			}
-			subV := firstNonEmpty(flags["sub"], cur.Subtitle)
-			bV := firstNonEmpty(flags["bullets"], strings.Join(cur.Bullets, ";"))
-			pV := firstNonEmpty(flags["prompt"], cur.ImagePrompt)
-			iu := firstNonEmpty(flags["imgurl"], cur.ImageURL)
-			// New prompt (and no explicit image override) => regenerate.
-			// Unchanged prompt => keep the existing illustration.
-			ip := ""
-			switch {
-			case flags["imgpath"] != "":
-				ip = flags["imgpath"]
-			case flags["imgurl"] != "":
-				ip = ""
-			case flags["prompt"] == "" || flags["prompt"] == cur.ImagePrompt:
-				ip = cur.ImagePath
+			if v := flags["sub"]; v != "" {
+				payload["subtitle"] = v
 			}
-			titleV := firstNonEmpty(title, cur.Title)
-			clientEdit(base, idQuery, titleV, subV, bV, pV, iu, ip)
+			if v := flags["bullets"]; v != "" {
+				payload["bullets"] = strings.Split(v, ";")
+			}
+			if v := flags["imgurl"]; v != "" {
+				payload["imageUrl"] = v
+			}
+			if v := flags["imgpath"]; v != "" {
+				payload["imagePath"] = v
+			}
+			if v := flags["prompt"]; v != "" {
+				payload["imagePrompt"] = v
+			} else if len(payload) == 0 {
+				fmt.Println("nothing to change — pass -sub/-bullets/-prompt/-imgurl/-imgpath")
+				return
+			}
+			clientEdit(base, idQuery, payload)
 			return
 		}
 		clientCreate(base, title, flags["sub"], flags["bullets"], flags["prompt"], flags["imgurl"])
@@ -607,7 +714,7 @@ func firstNonEmpty(vals ...string) string {
 
 // fetchBoard returns the current board for an id or id-suffix query.
 func fetchBoard(query string) *Board {
-	_, body, err := apiGet("http://127.0.0.1:8899", "/api/boards")
+	_, body, err := apiGet(localAPIBase, "/api/boards")
 	if err != nil || body == nil {
 		return nil
 	}
